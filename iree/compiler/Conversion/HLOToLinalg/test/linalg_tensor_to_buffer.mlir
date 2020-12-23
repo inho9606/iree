@@ -216,12 +216,12 @@ module {
 
 // CHECK-LABEL: func @store_value_twice
 //   CHECK-DAG:   %[[T0:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0, operand_result_index = 1 : i32}
-//       CHECK:   %[[T1:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
-//       CHECK:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
+//   CHECK-DAG:   %[[T1:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
+//   CHECK-DAG:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
 //       CHECK:   linalg.generic
 //  CHECK-SAME:     ins(%[[T2]] :
-//  CHECK-SAME:     outs(%[[T0]] :
-//       CHECK:   linalg.copy(%[[T0]], %[[T1]])
+//  CHECK-SAME:     outs(%[[T1]] :
+//       CHECK:   linalg.copy(%[[T1]], %[[T0]])
 
 // -----
 
@@ -263,14 +263,14 @@ module {
 }
 
 // CHECK-LABEL: func @store_reshape_src_and_result_0
-//       CHECK:   %[[T0:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
-//       CHECK:   %[[T1:.*]] = linalg.reshape %[[T0]]
-//       CHECK:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0, operand_result_index = 1 : i32}
-//       CHECK:   %[[T3:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
+//  CHECK-DAG:   %[[T0:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0, operand_result_index = 1 : i32}
+//  CHECK-DAG:   %[[T1:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
+//  CHECK-DAG:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
 //       CHECK:   linalg.generic
-//  CHECK-SAME:     ins(%[[T3]] :
-//  CHECK-SAME:     outs(%[[T1]] :
-//       CHECK:   linalg.copy(%[[T1]], %[[T2]])
+//  CHECK-SAME:     ins(%[[T2]] :
+//  CHECK-SAME:     outs(%[[T0]] :
+//       CHECK:   %[[T3:.*]] = linalg.reshape %[[T0]]
+//       CHECK:   linalg.copy(%[[T3]], %[[T1]])
 //       CHECK:   return
 
 // -----
@@ -316,11 +316,11 @@ module {
 //   CHECK-DAG:   %[[T0:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0, operand_result_index = 1 : i32}
 //   CHECK-DAG:   %[[T1:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
 //   CHECK-DAG:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
+//   CHECK-DAG:   %[[T3:.*]] = linalg.reshape %[[T1]]
 //       CHECK:   linalg.generic
 //  CHECK-SAME:     ins(%[[T2]] :
-//  CHECK-SAME:     outs(%[[T0]] :
-//       CHECK:   %[[T3:.*]] = linalg.reshape %[[T0]]
-//       CHECK:   linalg.copy(%[[T3]], %[[T1]])
+//  CHECK-SAME:     outs(%[[T3]] :
+//       CHECK:   linalg.copy(%[[T3]], %[[T0]])
 //       CHECK:   return
 
 // -----
@@ -372,15 +372,15 @@ module {
 
 // CHECK-LABEL: func @store_reshape_src_and_result_2
 //   CHECK-DAG:   %[[T0:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret0, operand_result_index = 1 : i32}
-//       CHECK:   %[[T1:.*]] = linalg.reshape %[[T0]]
-//   CHECK-DAG:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
-//   CHECK-DAG:   %[[T3:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret2, operand_result_index = 3 : i32}
+//   CHECK-DAG:   %[[T1:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
+//   CHECK-DAG:   %[[T2:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret2, operand_result_index = 3 : i32}
+//   CHECK-DAG:   %[[T3:.*]] = linalg.reshape %[[T2]]
 //   CHECK-DAG:   %[[T4:.*]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
 //       CHECK:   linalg.generic
-//  CHECK-SAME:   ins(%[[T4]] :
-//  CHECK-SAME:   outs(%[[T1]] :
-//       CHECK:   linalg.copy(%[[T0]], %[[T2]])
-//       CHECK:   linalg.copy(%[[T0]], %[[T3]])
+//  CHECK-SAME:     ins(%[[T4]] :
+//  CHECK-SAME:     outs(%[[T3]] :
+//       CHECK:   linalg.copy(%[[T2]], %[[T0]])
+//       CHECK:   linalg.copy(%[[T2]], %[[T1]])
 //       CHECK:   return
 
 // -----
@@ -476,54 +476,55 @@ module {
 }
 
 // CHECK-LABEL: func @generic_reshape_reshape
+//       CHECK:   %[[RET1:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
+//       CHECK:   %[[RET1_RESHAPE0:.+]] = linalg.reshape %[[RET1]]
+//  CHECK-SAME:     memref<1x1000xf32> into memref<1x1x1x1000xf32>
+//       CHECK:   %[[RET1_RESHAPE1:.+]] = linalg.reshape %[[RET1_RESHAPE0]]
+//  CHECK-SAME:     memref<1x1x1x1000xf32> into memref<1000xf32>
 //       CHECK:   %[[RET0:.+]] = iree.placeholder
 //  CHECK-SAME:     binding = @legacy_io::@ret0, operand_result_index = 1 : i32
-//       CHECK:   %[[RET0_RESHAPE:.+]] = linalg.reshape %[[RET0]]
-//  CHECK-SAME:     memref<1x1x1x1000xf32> into memref<1000xf32>
-//       CHECK:   %[[RET1:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@ret1, operand_result_index = 2 : i32}
 //       CHECK:   %[[ARG0:.+]] = iree.placeholder for "interface buffer" {binding = @legacy_io::@arg0, operand_result_index = 0 : i32}
 //       CHECK:   %[[ARG0_RESHAPE:.+]] = linalg.reshape %[[ARG0]]
 //  CHECK-SAME:     memref<1x1x1x1000xf32> into memref<1000xf32>
 //       CHECK:   linalg.generic
 //  CHECK-SAME:     ins(%[[ARG0_RESHAPE]] :
-//  CHECK-SAME:     outs(%[[RET0_RESHAPE]] :
-//       CHECK:   %[[RET0_RESHAPE2:.+]] = linalg.reshape %[[RET0]]
-//  CHECK-SAME:     memref<1x1x1x1000xf32> into memref<1x1000xf32>
-//       CHECK:   linalg.copy(%[[RET0_RESHAPE2]], %[[RET1]])
+//  CHECK-SAME:     outs(%[[RET1_RESHAPE1]] :
+//       CHECK:   linalg.copy(%[[RET1_RESHAPE0]], %[[RET0]])
 
 // -----
 
-#map0 = affine_map<(d0, d1) -> (d0, d1)>
 module {
   func @matmul_add() {
     %c0 = constant 0 : index
-    %shape = linalg.init_tensor[32, 64] : tensor<32x64xf32>
-    %0 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0
-      : tensor<32x48xf32>
-    %1 = hal.interface.load.tensor @legacy_io::@arg1, offset = %c0
-      : tensor<48x64xf32>
-    %2 = hal.interface.load.tensor @legacy_io::@arg2, offset = %c0
-      : tensor<32x64xf32>
-    %3 = "mhlo.dot"(%0, %1)
-      : (tensor<32x48xf32>, tensor<48x64xf32>) -> tensor<32x64xf32>
-    %4 = linalg.generic {
-      indexing_maps = [#map0, #map0, #map0],
-      iterator_types = ["parallel", "parallel"]}
-       ins(%2, %3 : tensor<32x64xf32>, tensor<32x64xf32>)
-      outs(%shape : tensor<32x64xf32>) {
-        ^bb0(%arg0: f32, %arg1: f32, %s: f32):
-          %5 = addf %arg0, %arg1 : f32
-          linalg.yield %5 : f32
-      } -> tensor<32x64xf32>
-    hal.interface.store.tensor %4, @legacy_io::@ret0, offset = %c0
-      : tensor<32x64xf32>
+    %cst = constant 0.000000e+00 : f32
+    %0 = linalg.init_tensor [32, 64] : tensor<32x64xf32>
+    %1 = hal.interface.load.tensor @legacy_io::@arg0, offset = %c0 : tensor<32x48xf32>
+    %2 = hal.interface.load.tensor @legacy_io::@arg1, offset = %c0 : tensor<48x64xf32>
+    %3 = hal.interface.load.tensor @legacy_io::@arg2, offset = %c0 : tensor<32x64xf32>
+    %4 = dynamic_tensor_from_elements  {
+    ^bb0(%arg0: index, %arg1: index):  // no predecessors
+      yield %cst : f32
+    } : tensor<32x64xf32>
+    %5 = linalg.matmul ins(%1, %2 : tensor<32x48xf32>, tensor<48x64xf32>)
+                       outs(%4 : tensor<32x64xf32>) -> tensor<32x64xf32>
+    %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                                          affine_map<(d0, d1) -> (d0, d1)>,
+                                          affine_map<(d0, d1) -> (d0, d1)>],
+                         iterator_types = ["parallel", "parallel"]
+    } ins(%3, %5 : tensor<32x64xf32>, tensor<32x64xf32>)
+      outs(%0 : tensor<32x64xf32>) {
+    ^bb0(%arg0: f32, %arg1: f32, %arg2: f32):  // no predecessors
+      %7 = addf %arg0, %arg1 : f32
+      linalg.yield %7 : f32
+    } -> tensor<32x64xf32>
+    hal.interface.store.tensor %6, @legacy_io::@ret0, offset = %c0 : tensor<32x64xf32>
     return
   }
-  hal.interface @legacy_io attributes {sym_visiblity = "private"} {
+  hal.interface @legacy_io attributes {sym_visibility = "private"} {
     hal.interface.binding @arg0, set=0, binding=0, type="StorageBuffer", access="Read"
     hal.interface.binding @arg1, set=0, binding=1, type="StorageBuffer", access="Read"
     hal.interface.binding @arg2, set=0, binding=2, type="StorageBuffer", access="Read"
-    hal.interface.binding @ret0, set=0, binding=3, type="StorageBuffer", access="Write|Discard"
+    hal.interface.binding @ret0, set=0, binding=3, type="StorageBuffer", access="Write"
   }
 }
 
@@ -542,4 +543,3 @@ module {
 //  CHECK-SAME:     ) outs(%[[RET0]]
 //  CHECK-SAME:     )
 //       CHECK:   return
-
