@@ -36,3 +36,65 @@ cc_library(
         "//iree/base:core_headers",
     ],
 )
+
+cc_library(
+    name = "executable_library",
+    hdrs = ["executable_library.h"],
+)
+
+cc_library(
+    name = "local",
+    srcs = [
+        "executable_loader.c",
+        "local_descriptor_set.c",
+        "local_descriptor_set_layout.c",
+        "local_executable.c",
+        "local_executable_cache.c",
+        "local_executable_layout.c",
+    ],
+    hdrs = [
+        "executable_loader.h",
+        "local_descriptor_set.h",
+        "local_descriptor_set_layout.h",
+        "local_executable.h",
+        "local_executable_cache.h",
+        "local_executable_layout.h",
+    ],
+    deps = [
+        ":executable_library",
+        "//iree/base:api",
+        "//iree/base:core_headers",
+        "//iree/base:tracing",
+        "//iree/hal:api",
+    ],
+)
+
+cc_library(
+    name = "task_driver",
+    srcs = [
+        "task_command_buffer.c",
+        "task_device.c",
+        "task_driver.c",
+        "task_event.c",
+        "task_queue.c",
+        "task_semaphore.c",
+    ],
+    hdrs = [
+        "task_command_buffer.h",
+        "task_device.h",
+        "task_driver.h",
+        "task_event.h",
+        "task_queue.h",
+        "task_semaphore.h",
+    ],
+    deps = [
+        ":arena",
+        ":local",
+        "//iree/base:api",
+        "//iree/base:core_headers",
+        "//iree/base:tracing",
+        "//iree/base:wait_handle",
+        "//iree/hal:api",
+        "//iree/task",
+    ],
+)

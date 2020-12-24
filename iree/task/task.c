@@ -139,8 +139,8 @@ iree_status_t iree_task_call_execute(
     iree_task_call_t* task, iree_task_submission_t* pending_submission) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  iree_status_t status =
-      task->closure.fn(task->closure.user_context, /*task_context=*/0);
+  iree_status_t status = task->closure.fn(task->closure.user_context,
+                                          (uintptr_t)pending_submission);
 
   iree_task_retire(&task->header, pending_submission);
   IREE_TRACE_ZONE_END(z0);
