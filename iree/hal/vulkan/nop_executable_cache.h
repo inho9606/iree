@@ -12,24 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef IREE_HAL_CC_EVENT_H_
-#define IREE_HAL_CC_EVENT_H_
+#ifndef IREE_HAL_VULKAN_NOP_EXECUTABLE_CACHE_H_
+#define IREE_HAL_VULKAN_NOP_EXECUTABLE_CACHE_H_
 
-#include "iree/hal/cc/resource.h"
+#include "iree/hal/api.h"
+#include "iree/hal/vulkan/handle_util.h"
 
-namespace iree {
-namespace hal {
+iree_status_t iree_hal_vulkan_nop_executable_cache_create(
+    iree::hal::vulkan::VkDeviceHandle* logical_device,
+    iree_string_view_t identifier,
+    iree_hal_executable_cache_t** out_executable_cache);
 
-// Events are used for defining synchronization scopes within CommandBuffers.
-// An event only exists within a single CommandBuffer and must not be used
-// across CommandBuffers from the same device or others.
-//
-// See CommandBuffer::SignalEvent and CommandBuffer::WaitEvents for more info.
-class Event : public Resource {
- public:
-};
-
-}  // namespace hal
-}  // namespace iree
-
-#endif  // IREE_HAL_CC_EVENT_H_
+#endif  // IREE_HAL_VULKAN_NOP_EXECUTABLE_CACHE_H_

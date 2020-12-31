@@ -20,26 +20,41 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/memory/memory.h"
 #include "absl/strings/str_cat.h"
-#include "absl/synchronization/mutex.h"
 #include "iree/base/math.h"
 #include "iree/base/status.h"
 #include "iree/base/time.h"
 #include "iree/base/tracing.h"
-#include "iree/hal/cc/command_queue.h"
-#include "iree/hal/cc/semaphore.h"
+#include "iree/hal/vulkan/command_queue.h"
+#include "iree/hal/vulkan/descriptor_pool_cache.h"
 #include "iree/hal/vulkan/direct_command_buffer.h"
 #include "iree/hal/vulkan/direct_command_queue.h"
 #include "iree/hal/vulkan/dynamic_symbols.h"
-#include "iree/hal/vulkan/emulated_timeline_semaphore.h"
+#include "iree/hal/vulkan/emulated_semaphore.h"
 #include "iree/hal/vulkan/extensibility_util.h"
+#include "iree/hal/vulkan/handle_util.h"
 #include "iree/hal/vulkan/native_descriptor_set.h"
+#include "iree/hal/vulkan/native_descriptor_set_layout.h"
 #include "iree/hal/vulkan/native_event.h"
-#include "iree/hal/vulkan/native_timeline_semaphore.h"
-#include "iree/hal/vulkan/pipeline_cache.h"
-#include "iree/hal/vulkan/pipeline_executable_layout.h"
+#include "iree/hal/vulkan/native_executable_layout.h"
+#include "iree/hal/vulkan/native_semaphore.h"
+#include "iree/hal/vulkan/nop_executable_cache.h"
 #include "iree/hal/vulkan/serializing_command_queue.h"
 #include "iree/hal/vulkan/status_util.h"
 #include "iree/hal/vulkan/vma_allocator.h"
+
+// DO NOT SUBMIT
+IREE_API_EXPORT iree_status_t IREE_API_CALL iree_hal_vulkan_wrap_device(
+    iree_string_view_t identifier, iree_hal_vulkan_syms_t* instance_syms,
+    VkInstance instance, VkPhysicalDevice physical_device,
+    VkDevice logical_device, iree_hal_vulkan_queue_set_t compute_queue_set,
+    iree_hal_vulkan_queue_set_t transfer_queue_set,
+    iree_allocator_t host_allocator, iree_hal_device_t** out_device) {
+  IREE_ASSERT_ARGUMENT(instance_syms);
+  IREE_ASSERT_ARGUMENT(instance);
+  IREE_ASSERT_ARGUMENT(physical_device);
+  IREE_ASSERT_ARGUMENT(logical_device);
+  IREE_ASSERT_ARGUMENT(out_device);
+}
 
 namespace iree {
 namespace hal {
@@ -165,7 +180,8 @@ StatusOr<ref_ptr<VkCommandPoolHandle>> CreateTransientCommandPool(
 absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> CreateCommandQueues(
     const DeviceInfo& device_info,
     const ref_ptr<VkDeviceHandle>& logical_device,
-    const QueueSet& compute_queue_set, const QueueSet& transfer_queue_set,
+    const iree_hal_vulkan_queue_set_t& compute_queue_set,
+    const iree_hal_vulkan_queue_set_t& transfer_queue_set,
     const ref_ptr<TimePointFencePool>& fence_pool,
     const ref_ptr<DynamicSymbols>& syms) {
   absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> command_queues;
@@ -182,12 +198,12 @@ absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> CreateCommandQueues(
 
     if (fence_pool != nullptr) {
       command_queues.push_back(absl::make_unique<SerializingCommandQueue>(
-          std::move(queue_name), IREE_HAL_COMMAND_CATEGORY_ANY, logical_device,
-          fence_pool, queue));
+          logical_device.get(), std::move(queue_name),
+          IREE_HAL_COMMAND_CATEGORY_ANY, queue, fence_pool.get()));
     } else {
       command_queues.push_back(absl::make_unique<DirectCommandQueue>(
-          std::move(queue_name), IREE_HAL_COMMAND_CATEGORY_ANY, logical_device,
-          queue));
+          logical_device.get(), std::move(queue_name),
+          IREE_HAL_COMMAND_CATEGORY_ANY, queue));
     }
   }
 
@@ -202,16 +218,176 @@ absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> CreateCommandQueues(
     std::string queue_name = absl::StrCat(device_info.name(), ":t", i);
     if (fence_pool != nullptr) {
       command_queues.push_back(absl::make_unique<SerializingCommandQueue>(
-          std::move(queue_name), IREE_HAL_COMMAND_CATEGORY_TRANSFER,
-          logical_device, fence_pool, queue));
+          logical_device.get(), std::move(queue_name),
+          IREE_HAL_COMMAND_CATEGORY_TRANSFER, queue, fence_pool.get()));
     } else {
       command_queues.push_back(absl::make_unique<DirectCommandQueue>(
-          std::move(queue_name), IREE_HAL_COMMAND_CATEGORY_TRANSFER,
-          logical_device, queue));
+          logical_device.get(), std::move(queue_name),
+          IREE_HAL_COMMAND_CATEGORY_TRANSFER, queue));
     }
   }
 
   return command_queues;
+}
+
+class VulkanDevice final : public DeviceBase {
+ public:
+  // Creates a device that manages its own VkDevice.
+  static StatusOr<ref_ptr<VulkanDevice>> Create(
+      ref_ptr<Driver> driver, VkInstance instance,
+      const DeviceInfo& device_info, VkPhysicalDevice physical_device,
+      iree_hal_vulkan_device_options_t options,
+      const ref_ptr<DynamicSymbols>& syms);
+
+  // Creates a device that wraps an externally managed VkDevice.
+  static StatusOr<ref_ptr<VulkanDevice>> Wrap(
+      ref_ptr<Driver> driver, VkInstance instance,
+      const DeviceInfo& device_info, VkPhysicalDevice physical_device,
+      VkDevice logical_device, iree_hal_vulkan_device_options_t options,
+      const iree_hal_vulkan_queue_set_t& compute_queue_set,
+      const iree_hal_vulkan_queue_set_t& transfer_queue_set,
+      const ref_ptr<DynamicSymbols>& syms);
+
+  VulkanDevice(
+      ref_ptr<Driver> driver, const DeviceInfo& device_info,
+      VkPhysicalDevice physical_device, ref_ptr<VkDeviceHandle> logical_device,
+      iree_hal_allocator_t* device_allocator,
+      absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> command_queues,
+      ref_ptr<VkCommandPoolHandle> dispatch_command_pool,
+      ref_ptr<VkCommandPoolHandle> transfer_command_pool,
+      ref_ptr<TimePointSemaphorePool> semaphore_pool,
+      ref_ptr<TimePointFencePool> fence_pool);
+  ~VulkanDevice() override;
+
+  const ref_ptr<DynamicSymbols>& syms() const {
+    return logical_device_->syms();
+  }
+
+  absl::string_view id() const override { return "vulkan"; }
+
+  Status CreateCommandBuffer(
+      iree_hal_command_buffer_mode_t mode,
+      iree_hal_command_category_t command_categories,
+      iree_hal_command_buffer_t** out_command_buffer) override;
+
+  Status CreateDescriptorSet(
+      iree_hal_descriptor_set_layout_t* set_layout,
+      absl::Span<const iree_hal_descriptor_set_binding_t> bindings,
+      iree_hal_descriptor_set_t** out_descriptor_set) override;
+
+  Status CreateDescriptorSetLayout(
+      iree_hal_descriptor_set_layout_usage_type_t usage_type,
+      absl::Span<const iree_hal_descriptor_set_layout_binding_t> bindings,
+      iree_hal_descriptor_set_layout_t** out_descriptor_set_layout) override;
+
+  Status CreateEvent(iree_hal_event_t** out_event) override;
+
+  Status CreateExecutableCache(
+      iree_string_view_t identifier,
+      iree_hal_executable_cache_t** out_executable_cache) override;
+
+  Status CreateExecutableLayout(
+      absl::Span<iree_hal_descriptor_set_layout_t*> set_layouts,
+      size_t push_constants,
+      iree_hal_executable_layout_t** out_executable_layout) override;
+
+  Status QueueSubmit(iree_hal_command_category_t command_categories,
+                     uint64_t queue_affinity, iree_host_size_t batch_count,
+                     const iree_hal_submission_batch_t* batches) override;
+
+  Status CreateSemaphore(uint64_t initial_value,
+                         iree_hal_semaphore_t** out_semaphore) override;
+
+  Status WaitSemaphores(iree_hal_wait_mode_t wait_mode,
+                        const iree_hal_semaphore_list_t* semaphore_list,
+                        iree_time_t deadline_ns) override;
+
+  Status WaitIdle(iree_time_t deadline_ns) override;
+
+ private:
+  Status WaitSemaphores(const iree_hal_semaphore_list_t* semaphore_list,
+                        iree_time_t deadline_ns,
+                        VkSemaphoreWaitFlags wait_flags);
+
+  bool emulating_timeline_semaphores() const {
+    return semaphore_pool_ != nullptr;
+  }
+
+  ref_ptr<Driver> driver_;
+  VkPhysicalDevice physical_device_;
+  ref_ptr<VkDeviceHandle> logical_device_;
+
+  iree_hal_allocator_t* allocator_;
+
+  mutable absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> command_queues_;
+  mutable absl::InlinedVector<CommandQueue*, 4> dispatch_queues_;
+  mutable absl::InlinedVector<CommandQueue*, 4> transfer_queues_;
+
+  ref_ptr<DescriptorPoolCache> descriptor_pool_cache_;
+
+  ref_ptr<VkCommandPoolHandle> dispatch_command_pool_;
+  ref_ptr<VkCommandPoolHandle> transfer_command_pool_;
+
+  // Fields used for emulated timeline semaphores.
+  ref_ptr<TimePointSemaphorePool> semaphore_pool_;
+  ref_ptr<TimePointFencePool> fence_pool_;
+};
+
+static StatusOr<ref_ptr<VulkanDevice>> CreateVulkanDevice(
+    ref_ptr<Driver> driver, const DeviceInfo& device_info, VkInstance instance,
+    VkPhysicalDevice physical_device, ref_ptr<VkDeviceHandle> logical_device,
+    iree_hal_vulkan_device_options_t options,
+    const iree_hal_vulkan_queue_set_t& compute_queue_set,
+    const iree_hal_vulkan_queue_set_t& transfer_queue_set) {
+  auto& syms = logical_device->syms();
+
+  // Create command pools for each queue family. If we don't have a transfer
+  // queue then we'll ignore that one and just use the dispatch pool.
+  // If we wanted to expose the pools through the HAL to allow the VM to more
+  // effectively manage them (pool per fiber, etc) we could, however I doubt
+  // the overhead of locking the pool will be even a blip.
+  IREE_ASSIGN_OR_RETURN(
+      auto dispatch_command_pool,
+      CreateTransientCommandPool(logical_device,
+                                 compute_queue_set.queue_family_index));
+  ref_ptr<VkCommandPoolHandle> transfer_command_pool;
+  if (transfer_queue_set.queue_indices != 0) {
+    IREE_ASSIGN_OR_RETURN(
+        transfer_command_pool,
+        CreateTransientCommandPool(logical_device,
+                                   transfer_queue_set.queue_family_index));
+  }
+
+  // Emulate timeline semaphores if associated functions are not defined.
+  ref_ptr<TimePointSemaphorePool> semaphore_pool = nullptr;
+  ref_ptr<TimePointFencePool> fence_pool = nullptr;
+  if (syms->vkGetSemaphoreCounterValue == nullptr ||
+      options.force_timeline_semaphore_emulation) {
+    IREE_ASSIGN_OR_RETURN(semaphore_pool, TimePointSemaphorePool::Create(
+                                              add_ref(logical_device)));
+    IREE_ASSIGN_OR_RETURN(fence_pool,
+                          TimePointFencePool::Create(add_ref(logical_device)));
+  }
+
+  auto command_queues =
+      CreateCommandQueues(device_info, logical_device, compute_queue_set,
+                          transfer_queue_set, fence_pool, syms);
+
+  // Create the device memory allocator.
+  iree_hal_allocator_t* allocator = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_vma_allocator_create(
+      instance, physical_device, logical_device.get(),
+      options.vma_record_settings, &allocator));
+
+  // DO NOT SUBMIT
+  // host_allocator from somewhere
+  // placement new into the host allocator
+
+  return assign_ref(new VulkanDevice(
+      std::move(driver), device_info, physical_device,
+      std::move(logical_device), allocator, std::move(command_queues),
+      std::move(dispatch_command_pool), std::move(transfer_command_pool),
+      std::move(semaphore_pool), std::move(fence_pool)));
 }
 
 }  // namespace
@@ -219,9 +395,8 @@ absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> CreateCommandQueues(
 // static
 StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Create(
     ref_ptr<Driver> driver, VkInstance instance, const DeviceInfo& device_info,
-    VkPhysicalDevice physical_device, Options options,
-    const ref_ptr<DynamicSymbols>& syms,
-    DebugCaptureManager* debug_capture_manager) {
+    VkPhysicalDevice physical_device, iree_hal_vulkan_device_options_t options,
+    const ref_ptr<DynamicSymbols>& syms) {
   IREE_TRACE_SCOPE0("VulkanDevice::Create");
 
   if (!options.extensibility_spec.optional_layers.empty() ||
@@ -236,8 +411,9 @@ StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Create(
       auto enabled_extension_names,
       MatchAvailableDeviceExtensions(physical_device,
                                      options.extensibility_spec, *syms));
-  auto enabled_device_extensions =
-      PopulateEnabledDeviceExtensions(enabled_extension_names);
+  iree_hal_vulkan_device_extensions_t enabled_device_extensions =
+      iree_hal_vulkan_populate_enabled_device_extensions(
+          enabled_extension_names);
 
   // Find queue families we will expose as HAL queues.
   IREE_ASSIGN_OR_RETURN(auto queue_family_info,
@@ -326,9 +502,9 @@ StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Create(
     device_create_info.pNext = &features2;
   }
 
-  auto logical_device =
-      make_ref<VkDeviceHandle>(syms, enabled_device_extensions,
-                               /*owns_device=*/true, /*allocator=*/nullptr);
+  auto logical_device = make_ref<VkDeviceHandle>(
+      syms, enabled_device_extensions,
+      /*owns_device=*/true, iree_allocator_system(), /*allocator=*/nullptr);
   // The Vulkan loader can leak here, depending on which features are enabled.
   // This is out of our control, so disable leak checks.
   IREE_DISABLE_LEAK_CHECKS();
@@ -339,36 +515,13 @@ StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Create(
       instance, logical_device->value()));
   IREE_ENABLE_LEAK_CHECKS();
 
-  // Create the device memory allocator.
-  // TODO(benvanik): allow other types to be plugged in.
-  IREE_ASSIGN_OR_RETURN(
-      auto allocator,
-      VmaAllocator::Create(physical_device, logical_device, instance,
-                           std::move(options.vma_options)));
-
-  // Create command pools for each queue family. If we don't have a transfer
-  // queue then we'll ignore that one and just use the dispatch pool.
-  // If we wanted to expose the pools through the HAL to allow the VM to more
-  // effectively manage them (pool per fiber, etc) we could, however I doubt
-  // the overhead of locking the pool will be even a blip.
-  IREE_ASSIGN_OR_RETURN(auto dispatch_command_pool,
-                        CreateTransientCommandPool(
-                            logical_device, queue_family_info.dispatch_index));
-  ref_ptr<VkCommandPoolHandle> transfer_command_pool;
-  if (has_dedicated_transfer_queues) {
-    IREE_ASSIGN_OR_RETURN(
-        transfer_command_pool,
-        CreateTransientCommandPool(logical_device,
-                                   queue_family_info.transfer_index));
-  }
-
   // Select queue indices and create command queues with them.
-  QueueSet compute_queue_set = {};
+  iree_hal_vulkan_queue_set_t compute_queue_set = {};
   compute_queue_set.queue_family_index = queue_family_info.dispatch_index;
   for (uint32_t i = 0; i < queue_family_info.dispatch_queue_count; ++i) {
     compute_queue_set.queue_indices |= 1ull << i;
   }
-  QueueSet transfer_queue_set = {};
+  iree_hal_vulkan_queue_set_t transfer_queue_set = {};
   transfer_queue_set.queue_family_index = queue_family_info.transfer_index;
   uint32_t base_queue_index = 0;
   if (queue_family_info.dispatch_index == queue_family_info.transfer_index) {
@@ -379,34 +532,18 @@ StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Create(
     transfer_queue_set.queue_indices |= 1ull << (i + base_queue_index);
   }
 
-  // Emulate timeline semaphores if associated functions are not defined.
-  ref_ptr<TimePointSemaphorePool> semaphore_pool = nullptr;
-  ref_ptr<TimePointFencePool> fence_pool = nullptr;
-  if (syms->vkGetSemaphoreCounterValue == nullptr ||
-      options.force_timeline_semaphore_emulation) {
-    IREE_ASSIGN_OR_RETURN(semaphore_pool, TimePointSemaphorePool::Create(
-                                              add_ref(logical_device)));
-    IREE_ASSIGN_OR_RETURN(fence_pool,
-                          TimePointFencePool::Create(add_ref(logical_device)));
-  }
-
-  auto command_queues =
-      CreateCommandQueues(device_info, logical_device, compute_queue_set,
-                          transfer_queue_set, fence_pool, syms);
-
-  return assign_ref(new VulkanDevice(
-      std::move(driver), device_info, physical_device,
-      std::move(logical_device), std::move(allocator),
-      std::move(command_queues), std::move(dispatch_command_pool),
-      std::move(transfer_command_pool), std::move(semaphore_pool),
-      std::move(fence_pool), debug_capture_manager));
+  return CreateVulkanDevice(std::move(driver), device_info, instance,
+                            physical_device, std::move(logical_device), options,
+                            compute_queue_set, transfer_queue_set);
 }
 
 // static
 StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Wrap(
     ref_ptr<Driver> driver, VkInstance instance, const DeviceInfo& device_info,
-    VkPhysicalDevice physical_device, VkDevice logical_device, Options options,
-    const QueueSet& compute_queue_set, const QueueSet& transfer_queue_set,
+    VkPhysicalDevice physical_device, VkDevice logical_device,
+    iree_hal_vulkan_device_options_t options,
+    const iree_hal_vulkan_queue_set_t& compute_queue_set,
+    const iree_hal_vulkan_queue_set_t& transfer_queue_set,
     const ref_ptr<DynamicSymbols>& syms) {
   IREE_TRACE_SCOPE0("VulkanDevice::Wrap");
 
@@ -430,87 +567,41 @@ StatusOr<ref_ptr<VulkanDevice>> VulkanDevice::Wrap(
       auto enabled_extension_names,
       MatchAvailableDeviceExtensions(physical_device,
                                      options.extensibility_spec, *syms));
-  auto enabled_device_extensions =
-      PopulateEnabledDeviceExtensions(enabled_extension_names);
+  iree_hal_vulkan_device_extensions_t enabled_device_extensions =
+      iree_hal_vulkan_populate_enabled_device_extensions(
+          enabled_extension_names);
 
   // Wrap the provided VkDevice with a VkDeviceHandle for use within the HAL.
-  auto device_handle =
-      make_ref<VkDeviceHandle>(syms, enabled_device_extensions,
-                               /*owns_device=*/false, /*allocator=*/nullptr);
+  auto device_handle = make_ref<VkDeviceHandle>(
+      syms, enabled_device_extensions,
+      /*owns_device=*/false, iree_allocator_system(), /*allocator=*/nullptr);
   *device_handle->mutable_value() = logical_device;
 
-  // Create the device memory allocator.
-  // TODO(benvanik): allow other types to be plugged in.
-  IREE_ASSIGN_OR_RETURN(
-      auto allocator,
-      VmaAllocator::Create(physical_device, device_handle, instance,
-                           std::move(options.vma_options)));
-
-  bool has_dedicated_transfer_queues = transfer_queue_count > 0;
-
-  // Create command pools for each queue family. If we don't have a transfer
-  // queue then we'll ignore that one and just use the dispatch pool.
-  // If we wanted to expose the pools through the HAL to allow the VM to more
-  // effectively manage them (pool per fiber, etc) we could, however I doubt
-  // the overhead of locking the pool will be even a blip.
-  IREE_ASSIGN_OR_RETURN(
-      auto dispatch_command_pool,
-      CreateTransientCommandPool(device_handle,
-                                 compute_queue_set.queue_family_index));
-  ref_ptr<VkCommandPoolHandle> transfer_command_pool;
-  if (has_dedicated_transfer_queues) {
-    IREE_ASSIGN_OR_RETURN(
-        transfer_command_pool,
-        CreateTransientCommandPool(device_handle,
-                                   transfer_queue_set.queue_family_index));
-  }
-
-  // Emulate timeline semaphores if associated functions are not defined.
-  ref_ptr<TimePointSemaphorePool> semaphore_pool = nullptr;
-  ref_ptr<TimePointFencePool> fence_pool = nullptr;
-  if (syms->vkGetSemaphoreCounterValue == nullptr ||
-      options.force_timeline_semaphore_emulation) {
-    IREE_ASSIGN_OR_RETURN(
-        semaphore_pool, TimePointSemaphorePool::Create(add_ref(device_handle)));
-    IREE_ASSIGN_OR_RETURN(fence_pool,
-                          TimePointFencePool::Create(add_ref(device_handle)));
-  }
-
-  auto command_queues =
-      CreateCommandQueues(device_info, device_handle, compute_queue_set,
-                          transfer_queue_set, fence_pool, syms);
-
-  return assign_ref(new VulkanDevice(
-      std::move(driver), device_info, physical_device, std::move(device_handle),
-      std::move(allocator), std::move(command_queues),
-      std::move(dispatch_command_pool), std::move(transfer_command_pool),
-      std::move(semaphore_pool), std::move(fence_pool),
-      /*debug_capture_manager=*/nullptr));
+  return CreateVulkanDevice(std::move(driver), device_info, instance,
+                            physical_device, std::move(device_handle), options,
+                            compute_queue_set, transfer_queue_set);
 }
 
 VulkanDevice::VulkanDevice(
     ref_ptr<Driver> driver, const DeviceInfo& device_info,
     VkPhysicalDevice physical_device, ref_ptr<VkDeviceHandle> logical_device,
-    std::unique_ptr<Allocator> allocator,
+    iree_hal_allocator_t* device_allocator,
     absl::InlinedVector<std::unique_ptr<CommandQueue>, 4> command_queues,
     ref_ptr<VkCommandPoolHandle> dispatch_command_pool,
     ref_ptr<VkCommandPoolHandle> transfer_command_pool,
     ref_ptr<TimePointSemaphorePool> semaphore_pool,
-    ref_ptr<TimePointFencePool> fence_pool,
-    DebugCaptureManager* debug_capture_manager)
-    : Device(device_info),
+    ref_ptr<TimePointFencePool> fence_pool)
+    : DeviceBase(host_allocator, device_allocator),
       driver_(std::move(driver)),
       physical_device_(physical_device),
       logical_device_(std::move(logical_device)),
-      allocator_(std::move(allocator)),
       command_queues_(std::move(command_queues)),
       descriptor_pool_cache_(
           make_ref<DescriptorPoolCache>(add_ref(logical_device_))),
       dispatch_command_pool_(std::move(dispatch_command_pool)),
       transfer_command_pool_(std::move(transfer_command_pool)),
       semaphore_pool_(std::move(semaphore_pool)),
-      fence_pool_(std::move(fence_pool)),
-      debug_capture_manager_(debug_capture_manager) {
+      fence_pool_(std::move(fence_pool)) {
   // Populate the queue lists based on queue capabilities.
   for (auto& command_queue : command_queues_) {
     if (command_queue->can_dispatch()) {
@@ -522,18 +613,10 @@ VulkanDevice::VulkanDevice(
       transfer_queues_.push_back(command_queue.get());
     }
   }
-
-  if (debug_capture_manager_ && debug_capture_manager_->is_connected()) {
-    // Record a capture covering the duration of this VkDevice's lifetime.
-    debug_capture_manager_->StartCapture();
-  }
 }
 
 VulkanDevice::~VulkanDevice() {
   IREE_TRACE_SCOPE0("VulkanDevice::dtor");
-  if (debug_capture_manager_ && debug_capture_manager_->is_capturing()) {
-    debug_capture_manager_->StopCapture();
-  }
 
   // Drop all command queues. These may wait until idle.
   command_queues_.clear();
@@ -552,288 +635,104 @@ VulkanDevice::~VulkanDevice() {
   logical_device_.reset();
 }
 
-std::string VulkanDevice::DebugString() const {
-  return absl::StrCat(Device::DebugString(),                                 //
-                      "\n[VulkanDevice]",                                    //
-                      "\n  Command Queues: ", command_queues_.size(),        //
-                      "\n    - Dispatch Queues: ", dispatch_queues_.size(),  //
-                      "\n    - Transfer Queues: ", transfer_queues_.size());
+Status VulkanDevice::CreateExecutableCache(
+    iree_string_view_t identifier,
+    iree_hal_executable_cache_t** out_executable_cache) {
+  return iree_hal_vulkan_nop_executable_cache_create(
+      logical_device_.get(), identifier, out_executable_cache);
 }
 
-ref_ptr<ExecutableCache> VulkanDevice::CreateExecutableCache() {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateExecutableCache");
-  return make_ref<PipelineCache>(add_ref(logical_device_));
-}
-
-StatusOr<ref_ptr<DescriptorSetLayout>> VulkanDevice::CreateDescriptorSetLayout(
+Status VulkanDevice::CreateDescriptorSetLayout(
     iree_hal_descriptor_set_layout_usage_type_t usage_type,
-    absl::Span<const iree_hal_descriptor_set_layout_binding_t> bindings) {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateDescriptorSetLayout");
-
-  absl::InlinedVector<VkDescriptorSetLayoutBinding, 4> native_bindings(
-      bindings.size());
-  for (int i = 0; i < bindings.size(); ++i) {
-    auto& native_binding = native_bindings[i];
-    native_binding.binding = bindings[i].binding;
-    native_binding.descriptorType =
-        static_cast<VkDescriptorType>(bindings[i].type);
-    native_binding.descriptorCount = 1;
-    native_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    native_binding.pImmutableSamplers = nullptr;
-  }
-
-  VkDescriptorSetLayoutCreateInfo create_info;
-  create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  create_info.pNext = nullptr;
-  create_info.flags = 0;
-  if (usage_type == IREE_HAL_DESCRIPTOR_SET_LAYOUT_USAGE_TYPE_PUSH_ONLY &&
-      logical_device_->enabled_extensions().push_descriptors) {
-    // Note that we can *only* use push descriptor sets if we set this create
-    // flag. If push descriptors aren't supported we emulate them with normal
-    // descriptors so it's fine to have kPushOnly without support.
-    create_info.flags |=
-        VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-  }
-  create_info.bindingCount = native_bindings.size();
-  create_info.pBindings = native_bindings.data();
-
-  // Create and insert into the cache.
-  VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
-  VK_RETURN_IF_ERROR(syms()->vkCreateDescriptorSetLayout(
-      *logical_device_, &create_info, logical_device_->allocator(),
-      &descriptor_set_layout));
-
-  return make_ref<NativeDescriptorSetLayout>(add_ref(logical_device_),
-                                             descriptor_set_layout);
+    absl::Span<const iree_hal_descriptor_set_layout_binding_t> bindings,
+    iree_hal_descriptor_set_layout_t** out_descriptor_set_layout) {
+  return iree_hal_vulkan_native_descriptor_set_layout_create(
+      logical_device_.get(), usage_type, bindings.size(), bindings.data(),
+      out_descriptor_set_layout);
 }
 
-StatusOr<ref_ptr<ExecutableLayout>> VulkanDevice::CreateExecutableLayout(
-    absl::Span<DescriptorSetLayout* const> set_layouts, size_t push_constants) {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateExecutableLayout");
-
-  absl::InlinedVector<ref_ptr<NativeDescriptorSetLayout>, 2> typed_set_layouts(
-      set_layouts.size());
-  absl::InlinedVector<VkDescriptorSetLayout, 2> set_layout_handles(
-      set_layouts.size());
-  for (int i = 0; i < set_layouts.size(); ++i) {
-    typed_set_layouts[i] =
-        add_ref(static_cast<NativeDescriptorSetLayout*>(set_layouts[i]));
-    set_layout_handles[i] = typed_set_layouts[i]->handle();
-  }
-
-  absl::InlinedVector<VkPushConstantRange, 1> push_constant_ranges;
-  if (push_constants > 0) {
-    push_constant_ranges.push_back(VkPushConstantRange{
-        VK_SHADER_STAGE_COMPUTE_BIT, 0,
-        static_cast<uint32_t>(sizeof(uint32_t) * push_constants)});
-  }
-
-  VkPipelineLayoutCreateInfo create_info;
-  create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  create_info.pNext = nullptr;
-  create_info.flags = 0;
-  create_info.setLayoutCount = set_layout_handles.size();
-  create_info.pSetLayouts = set_layout_handles.data();
-  create_info.pushConstantRangeCount = push_constant_ranges.size();
-  create_info.pPushConstantRanges = push_constant_ranges.data();
-
-  // Create and insert into the cache.
-  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-  VK_RETURN_IF_ERROR(syms()->vkCreatePipelineLayout(
-      *logical_device_, &create_info, logical_device_->allocator(),
-      &pipeline_layout));
-
-  return make_ref<PipelineExecutableLayout>(
-      add_ref(logical_device_), pipeline_layout, std::move(typed_set_layouts));
+Status VulkanDevice::CreateExecutableLayout(
+    absl::Span<iree_hal_descriptor_set_layout_t*> set_layouts,
+    size_t push_constants,
+    iree_hal_executable_layout_t** out_executable_layout) {
+  return iree_hal_vulkan_native_executable_layout_create(
+      logical_device_.get(), set_layouts.size(), set_layouts.data(),
+      push_constants, out_executable_layout);
 }
 
-StatusOr<ref_ptr<DescriptorSet>> VulkanDevice::CreateDescriptorSet(
-    DescriptorSetLayout* set_layout,
-    absl::Span<const iree_hal_descriptor_set_binding_t> bindings) {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateDescriptorSet");
+Status VulkanDevice::CreateDescriptorSet(
+    iree_hal_descriptor_set_layout_t* set_layout,
+    absl::Span<const iree_hal_descriptor_set_binding_t> bindings,
+    iree_hal_descriptor_set_t** out_descriptor_set) {
   return UnimplementedErrorBuilder(IREE_LOC)
          << "CreateDescriptorSet not yet implemented (needs timeline)";
 }
 
-StatusOr<ref_ptr<CommandBuffer>> VulkanDevice::CreateCommandBuffer(
+Status VulkanDevice::CreateCommandBuffer(
     iree_hal_command_buffer_mode_t mode,
-    iree_hal_command_category_t command_categories) {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateCommandBuffer");
-
+    iree_hal_command_category_t command_categories,
+    iree_hal_command_buffer_t** out_command_buffer) {
   // Select the command pool to used based on the types of commands used.
   // Note that we may not have a dedicated transfer command pool if there are
   // no dedicated transfer queues.
-  ref_ptr<VkCommandPoolHandle> command_pool;
+  VkCommandPoolHandle* command_pool = NULL;
   if (transfer_command_pool_ &&
       !iree_all_bits_set(command_categories,
                          IREE_HAL_COMMAND_CATEGORY_DISPATCH)) {
-    command_pool = add_ref(transfer_command_pool_);
+    command_pool = transfer_command_pool_.get();
   } else {
-    command_pool = add_ref(dispatch_command_pool_);
+    command_pool = dispatch_command_pool_.get();
   }
-
-  VkCommandBufferAllocateInfo allocate_info;
-  allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  allocate_info.pNext = nullptr;
-  allocate_info.commandPool = *command_pool;
-  allocate_info.commandBufferCount = 1;
-  allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-
-  VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-  {
-    absl::MutexLock lock(command_pool->mutex());
-    VK_RETURN_IF_ERROR(syms()->vkAllocateCommandBuffers(
-        *logical_device_, &allocate_info, &command_buffer));
-  }
-
-  return make_ref<DirectCommandBuffer>(mode, command_categories,
-                                       add_ref(descriptor_pool_cache_),
-                                       add_ref(command_pool), command_buffer);
+  return iree_hal_vulkan_direct_command_buffer_allocate(
+      logical_device_.get(), command_pool, mode, command_categories,
+      descriptor_pool_cache_.get(), out_command_buffer);
 }
 
-StatusOr<ref_ptr<Event>> VulkanDevice::CreateEvent() {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateEvent");
-
-  // TODO(b/138729892): pool events.
-  VkEventCreateInfo create_info;
-  create_info.sType = VK_STRUCTURE_TYPE_EVENT_CREATE_INFO;
-  create_info.pNext = nullptr;
-  create_info.flags = 0;
-  VkEvent event_handle = VK_NULL_HANDLE;
-  VK_RETURN_IF_ERROR(syms()->vkCreateEvent(*logical_device_, &create_info,
-                                           logical_device_->allocator(),
-                                           &event_handle));
-
-  return make_ref<NativeEvent>(add_ref(logical_device_), event_handle);
+Status VulkanDevice::CreateEvent(iree_hal_event_t** out_event) {
+  return iree_hal_vulkan_native_event_create(logical_device_.get(), out_event);
 }
 
-StatusOr<ref_ptr<Semaphore>> VulkanDevice::CreateSemaphore(
-    uint64_t initial_value) {
-  IREE_TRACE_SCOPE0("VulkanDevice::CreateSemaphore");
-
+Status VulkanDevice::CreateSemaphore(uint64_t initial_value,
+                                     iree_hal_semaphore_t** out_semaphore) {
   if (emulating_timeline_semaphores()) {
-    return EmulatedTimelineSemaphore::Create(
-        add_ref(logical_device_),
-        // Triggers necessary processing on all queues due to new values gotten
-        // signaled for the given timeline |semaphore|.
-        // Different clang-format versions disagree about asterisk placement.
-        // clang-format off
-        [this](Semaphore* /*semaphore*/) -> Status {
-          // clang-format on
-          IREE_TRACE_SCOPE0("<lambda>::OnSemaphoreSignal");
-          for (const auto& queue : command_queues_) {
-            IREE_RETURN_IF_ERROR(
-                static_cast<SerializingCommandQueue*>(queue.get())
-                    ->AdvanceQueueSubmission());
-          }
-          return OkStatus();
-        },
-        // Triggers necessary processing on all queues due to failures for the
-        // given timeline |semaphore|.
-        [this](Semaphore* /*semaphore*/) {
-          IREE_TRACE_SCOPE0("<lambda>::OnSemaphoreFailure");
-          for (const auto& queue : command_queues_) {
-            static_cast<SerializingCommandQueue*>(queue.get())
-                ->AbortQueueSubmission();
-          }
-        },
-        // Triggers necessary processing on all queues due to the given |fence|
-        // being signaled. This allows the queue to drop the fence ref it holds
-        // even when we are not waiting on the queue directly.
-        [this](absl::Span<VkFence> fences) {
-          IREE_TRACE_SCOPE0("<lambda>::OnFenceSignal");
-          for (const auto& queue : command_queues_) {
-            static_cast<SerializingCommandQueue*>(queue.get())
-                ->SignalFences(fences);
-          }
-        },
-        add_ref(semaphore_pool_), initial_value);
+    return iree_hal_vulkan_emulated_semaphore_create(
+        logical_device_.get(),
+        ReinterpretSpan<CommandQueue*>(absl::MakeSpan(command_queues_)),
+        semaphore_pool_.get(), initial_value, out_semaphore);
   }
-
-  return NativeTimelineSemaphore::Create(add_ref(logical_device_),
-                                         initial_value);
+  return iree_hal_vulkan_native_semaphore_create(logical_device_.get(),
+                                                 initial_value, out_semaphore);
 }
 
 Status VulkanDevice::WaitAllSemaphores(
-    absl::Span<const SemaphoreValue> semaphores, Time deadline_ns) {
-  IREE_TRACE_SCOPE0("VulkanDevice::WaitAllSemaphores");
-  return WaitSemaphores(semaphores, deadline_ns, /*wait_flags=*/0);
+    const iree_hal_semaphore_list_t* semaphore_list, iree_time_t deadline_ns) {
+  return WaitSemaphores(semaphore_list, deadline_ns, /*wait_flags=*/0);
 }
 
-StatusOr<int> VulkanDevice::WaitAnySemaphore(
-    absl::Span<const SemaphoreValue> semaphores, Time deadline_ns) {
-  IREE_TRACE_SCOPE0("VulkanDevice::WaitAnySemaphore");
-  return WaitSemaphores(semaphores, deadline_ns,
+Status VulkanDevice::WaitAnySemaphore(
+    const iree_hal_semaphore_list_t* semaphore_list, iree_time_t deadline_ns) {
+  return WaitSemaphores(semaphore_list, deadline_ns,
                         /*wait_flags=*/VK_SEMAPHORE_WAIT_ANY_BIT);
 }
 
-Status VulkanDevice::WaitSemaphores(absl::Span<const SemaphoreValue> semaphores,
-                                    Time deadline_ns,
-                                    VkSemaphoreWaitFlags wait_flags) {
-  IREE_TRACE_SCOPE0("VulkanDevice::WaitSemaphores");
-
+Status VulkanDevice::WaitSemaphores(
+    const iree_hal_semaphore_list_t* semaphore_list, iree_time_t deadline_ns,
+    VkSemaphoreWaitFlags wait_flags) {
   if (emulating_timeline_semaphores()) {
-    // TODO(antiagainst): We actually should get the fences associated with the
-    // emulated timeline semaphores so that we can wait them in a bunch. This
-    // implementation is problematic if we wait to wait any and we have the
-    // first semaphore taking extra long time but the following ones signal
-    // quickly.
-    for (int i = 0; i < semaphores.size(); ++i) {
-      auto* semaphore =
-          static_cast<EmulatedTimelineSemaphore*>(semaphores[i].semaphore);
-      IREE_RETURN_IF_ERROR(semaphore->Wait(semaphores[i].value, deadline_ns));
-      if (wait_flags & VK_SEMAPHORE_WAIT_ANY_BIT) return OkStatus();
-    }
-
-    return OkStatus();
+    return iree_hal_vulkan_emulated_semaphore_multi_wait(
+        logical_device_.get(), semaphore_list, deadline_ns, wait_flags);
   }
-
-  absl::InlinedVector<VkSemaphore, 4> semaphore_handles(semaphores.size());
-  absl::InlinedVector<uint64_t, 4> semaphore_values(semaphores.size());
-  for (int i = 0; i < semaphores.size(); ++i) {
-    semaphore_handles[i] =
-        static_cast<NativeTimelineSemaphore*>(semaphores[i].semaphore)
-            ->handle();
-    semaphore_values[i] = semaphores[i].value;
-  }
-
-  VkSemaphoreWaitInfo wait_info;
-  wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-  wait_info.pNext = nullptr;
-  wait_info.flags = wait_flags;
-  wait_info.semaphoreCount = semaphore_handles.size();
-  wait_info.pSemaphores = semaphore_handles.data();
-  wait_info.pValues = semaphore_values.data();
-
-  // NOTE: this may fail with a timeout (VK_TIMEOUT) or in the case of a
-  // device loss event may return either VK_SUCCESS *or* VK_ERROR_DEVICE_LOST.
-  // We may want to explicitly query for device loss after a successful wait
-  // to ensure we consistently return errors.
-  uint64_t timeout_ns =
-      static_cast<uint64_t>(DeadlineToRelativeTimeoutNanos(deadline_ns));
-  VkResult result =
-      syms()->vkWaitSemaphores(*logical_device_, &wait_info, timeout_ns);
-  if (result == VK_ERROR_DEVICE_LOST) {
-    // Nothing we do now matters.
-    return VkResultToStatus(result, IREE_LOC);
-  }
-
-  // TODO(benvanik): notify the resource timeline that it should check for the
-  // semaphores we waited on (including those already expired above).
-
-  return OkStatus();
+  return iree_hal_vulkan_native_semaphore_multi_wait(
+      logical_device_.get(), semaphore_list, deadline_ns, wait_flags);
 }
 
-Status VulkanDevice::WaitIdle(Time deadline_ns) {
-  if (deadline_ns == InfiniteFuture()) {
+Status VulkanDevice::WaitIdle(iree_time_t deadline_ns) {
+  if (deadline_ns == IREE_TIME_INFINITE_FUTURE) {
     // Fast path for using vkDeviceWaitIdle, which is usually cheaper (as it
     // requires fewer calls into the driver).
-    IREE_TRACE_SCOPE0("VulkanDevice::WaitIdle#vkDeviceWaitIdle");
     VK_RETURN_IF_ERROR(syms()->vkDeviceWaitIdle(*logical_device_));
     return OkStatus();
   }
-
-  IREE_TRACE_SCOPE0("VulkanDevice::WaitIdle#Semaphores");
   for (auto& command_queue : command_queues_) {
     IREE_RETURN_IF_ERROR(command_queue->WaitIdle(deadline_ns));
   }
