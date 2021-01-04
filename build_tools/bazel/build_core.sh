@@ -46,7 +46,7 @@ declare -a test_env_args=(
 )
 
 declare -a default_build_tag_filters=("-nokokoro")
-declare -a default_test_tag_filters=("-nokokoro" "-driver=metal")
+declare -a default_test_tag_filters=("-nokokoro")
 
 if [[ "${IREE_VULKAN_DISABLE?}" == 1 ]]; then
   default_test_tag_filters+=("-driver=vulkan")
